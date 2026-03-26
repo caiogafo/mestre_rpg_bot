@@ -1,0 +1,19 @@
+[project]
+name = "mestre-rpg-bot"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "caiogafo",email = "caiogafo@gmail.com"}
+]
+requires-python = ">=3.13"
+dependencies = [
+    "discord-py (>=2.7.1,<3.0.0)",
+    "python-dotenv (>=1.2.2,<2.0.0)",
+    "sqlalchemy (>=2.0.48,<3.0.0)",
+    "httpx (>=0.28.1,<0.29.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
