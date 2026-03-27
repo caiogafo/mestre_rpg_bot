@@ -222,6 +222,7 @@ def aplicar_xp_personagem(personagem, xp_adicional: int) -> Tuple[int, int]:
     total_mana_increase = 0
     pontos_gain = 0
 
+    niveis_ganhos = max(0, nivel_novo - nivel_anterior)
     for lvl in range(nivel_anterior + 1, nivel_novo + 1):
         hp_inc = max(1, hit_die_avg + con_mod)
         mana_inc = mana_increase_por_nivel(getattr(personagem, "classe", ""), int_mod)
@@ -243,6 +244,11 @@ def aplicar_xp_personagem(personagem, xp_adicional: int) -> Tuple[int, int]:
     personagem.mana = min(int(personagem.mana or 0) + total_mana_increase, int(personagem.mana_max))
 
     personagem.pontos_disponiveis = int(getattr(personagem, "pontos_disponiveis", 0) or 0) + pontos_gain
+    # D&D: ganha 1 dado de vida por nível; disponível também aumenta em +1 no avanço.
+    personagem.dados_vida_total = int(getattr(personagem, "dados_vida_total", nivel_anterior) or nivel_anterior) + niveis_ganhos
+    personagem.dados_vida_disponiveis = int(getattr(personagem, "dados_vida_disponiveis", nivel_anterior) or nivel_anterior) + niveis_ganhos
+    if personagem.dados_vida_disponiveis > personagem.dados_vida_total:
+        personagem.dados_vida_disponiveis = personagem.dados_vida_total
 
     return (nivel_anterior, nivel_novo)
 

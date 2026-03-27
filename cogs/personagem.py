@@ -1,8 +1,10 @@
 import discord
+import random
 from discord.ext import commands
 from database import SessionLocal, Personagem, Item
 from xp_system import XP_THRESHOLDS, aplicar_asi_5e
 from spellcasting_dnd import CLASSES_CANONICAS, RACAS_CANONICAS, normalizar_classe, normalizar_raca
+from xp_system import hit_die_por_classe
 
 class PersonagemCog(commands.Cog):
     def __init__(self, bot):
@@ -72,6 +74,8 @@ class PersonagemCog(commands.Cog):
                 arma_tipo="MELEE",
                 proficiencia=2
             )
+            novo_p.dados_vida_total = 1
+            novo_p.dados_vida_disponiveis = 1
 
             db.add(novo_p)
             db.commit()
@@ -140,6 +144,9 @@ class PersonagemCog(commands.Cog):
                     xp_info = f"`{xp_total}` XP | Próximo ({proximo_nivel}): `{proximo_threshold}` XP (faltam {faltam})"
 
             embed.add_field(name="📈 XP", value=xp_info, inline=False)
+            dv_total = int(getattr(p, "dados_vida_total", max(1, nivel_atual)) or max(1, nivel_atual))
+            dv_disp = int(getattr(p, "dados_vida_disponiveis", dv_total) or dv_total)
+            embed.add_field(name="🛌 Descanso", value=f"Dados de Vida: `{dv_disp}/{dv_total}`", inline=False)
 
             itens = db.query(Item).filter(Item.personagem_id == p.id).order_by(Item.nome).all()
             if itens:
@@ -229,6 +236,101 @@ class PersonagemCog(commands.Cog):
         # Nota: Como ainda não temos uma tabela de magias complexa, 
         # estamos apenas confirmando o registro narrativo aqui.
         await ctx.send(f"✨ **{nome}** (Nível {level}) foi adicionada ao seu grimório!")
+
+    @commands.command()
+    async def descanso_curto(self, ctx, dados: int = 1):
+        """
+        Descanso curto: gasta Dados de Vida para recuperar HP.
+        Uso: !descanso_curto [qtd_dados]
+        """
+        if dados <= 0:
+            return await ctx.send("❌ Informe uma quantidade de dados de vida maior que 0.")
+
+        db = SessionLocal()
+        try:
+            p = db.query(Personagem).filter(Personagem.discord_id == str(ctx.author.id)).first()
+            if not p:
+                return await ctx.send("❓ Use `!criar_ficha` primeiro.")
+
+            nivel = int(getattr(p, "nivel", 1) or 1)
+            p.dados_vida_total = int(getattr(p, "dados_vida_total", nivel) or nivel)
+            if p.dados_vida_total < nivel:
+                p.dados_vida_total = nivel
+            p.dados_vida_disponiveis = int(getattr(p, "dados_vida_disponiveis", p.dados_vida_total) or p.dados_vida_total)
+            if p.dados_vida_disponiveis > p.dados_vida_total:
+                p.dados_vida_disponiveis = p.dados_vida_total
+
+            gastar = min(int(dados), int(p.dados_vida_disponiveis))
+            if gastar <= 0:
+                return await ctx.send("❌ Você não tem Dados de Vida disponíveis. Faça `!descanso_longo`.")
+
+            faces = hit_die_por_classe(getattr(p, "classe", ""))
+            con_mod = self.calc_mod(int(getattr(p, "constituicao", 10) or 10))
+            rolagens = [max(1, random.randint(1, faces) + con_mod) for _ in range(gastar)]
+            cura_total = sum(rolagens)
+
+            hp_antes = int(p.hp or 0)
+            p.hp = min(int(p.hp_max or 0), hp_antes + cura_total)
+            curado = int(p.hp) - hp_antes
+            p.dados_vida_disponiveis = int(p.dados_vida_disponiveis) - gastar
+
+            # House rule: Bruxo recupera mana no descanso curto.
+            mana_extra = ""
+            if (getattr(p, "classe", "") or "").strip().lower() == "bruxo":
+                p.mana = int(p.mana_max or p.mana)
+                mana_extra = f"\n🔵 Mana restaurada: `{p.mana}/{p.mana_max}` (regra de Bruxo)."
+
+            db.commit()
+            await ctx.send(
+                f"🛌 **{p.nome}** fez descanso curto e gastou **{gastar}** DV (`d{faces}`).\n"
+                f"❤️ Recuperou **{curado} HP** (`{p.hp}/{p.hp_max}`).\n"
+                f"🎲 Rolagens: `{', '.join(str(r) for r in rolagens)}`\n"
+                f"📉 DV restantes: `{p.dados_vida_disponiveis}/{p.dados_vida_total}`"
+                f"{mana_extra}"
+            )
+        finally:
+            db.close()
+
+    @commands.command()
+    async def descanso_longo(self, ctx):
+        """
+        Descanso longo: restaura HP/Mana e recupera metade dos Dados de Vida (mínimo 1).
+        """
+        db = SessionLocal()
+        try:
+            p = db.query(Personagem).filter(Personagem.discord_id == str(ctx.author.id)).first()
+            if not p:
+                return await ctx.send("❓ Use `!criar_ficha` primeiro.")
+
+            nivel = int(getattr(p, "nivel", 1) or 1)
+            p.dados_vida_total = int(getattr(p, "dados_vida_total", nivel) or nivel)
+            if p.dados_vida_total < nivel:
+                p.dados_vida_total = nivel
+            p.dados_vida_disponiveis = int(getattr(p, "dados_vida_disponiveis", p.dados_vida_total) or p.dados_vida_total)
+
+            recuperar_dv = max(1, p.dados_vida_total // 2)
+            dv_antes = p.dados_vida_disponiveis
+            p.dados_vida_disponiveis = min(p.dados_vida_total, p.dados_vida_disponiveis + recuperar_dv)
+            dv_ganhos = p.dados_vida_disponiveis - dv_antes
+
+            p.hp = int(p.hp_max or p.hp)
+            p.mana = int(p.mana_max or p.mana)
+            if getattr(p, "linhagem", "") == "Vampiro":
+                p.sede = max(0, int(getattr(p, "sede", 0) or 0) - 20)
+
+            db.commit()
+            extra_vamp = ""
+            if getattr(p, "linhagem", "") == "Vampiro":
+                extra_vamp = f"\n🩸 Sede após descanso: `{p.sede}%`."
+
+            await ctx.send(
+                f"🌙 **{p.nome}** concluiu um descanso longo.\n"
+                f"❤️ HP: `{p.hp}/{p.hp_max}` | 🔵 Mana: `{p.mana}/{p.mana_max}`\n"
+                f"🎲 Dados de Vida recuperados: `+{dv_ganhos}` → `{p.dados_vida_disponiveis}/{p.dados_vida_total}`"
+                f"{extra_vamp}"
+            )
+        finally:
+            db.close()
 
 async def setup(bot):
     await bot.add_cog(PersonagemCog(bot))

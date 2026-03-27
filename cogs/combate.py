@@ -3,6 +3,7 @@ import random
 import httpx
 from discord.ext import commands
 from database import SessionLocal, Personagem, Magia
+from permissions import require_mestre
 from xp_system import aplicar_xp_personagem, cr_para_xp, multiplicador_grupo_monstros
 from magia_combate import (
     MAGIA_ESPECIAL,
@@ -11,6 +12,17 @@ from magia_combate import (
     rolar_string_dado,
     dc_conjuracao_generico,
     rolar_teste_resistencia,
+)
+from cogs._combat_helpers import (
+    calc_mod as core_calc_mod,
+    clean_name,
+    extract_monster_spells,
+    find_active_monster,
+    get_save_modifier,
+    has_initiative_advantage,
+    roll_d20,
+    roll_spell_damage,
+    spell_fallback,
 )
 
 class CombateCog(commands.Cog):
@@ -24,7 +36,41 @@ class CombateCog(commands.Cog):
         self.aliados = []
 
     def calc_mod(self, valor):
-        return (valor - 10) // 2
+        return core_calc_mod(valor)
+
+    def _rolar_d20(self, vantagem: bool = False, desvantagem: bool = False):
+        return roll_d20(vantagem=vantagem, desvantagem=desvantagem)
+
+    def _vantagem_iniciativa(self, p) -> bool:
+        return has_initiative_advantage(p)
+
+    def _achar_monstro_ativo(self, nome_instancia: str):
+        return find_active_monster(self.monstros_ativos, nome_instancia)
+
+    async def _carregar_ficha_monstro(self, slug: str):
+        url = f"https://www.dnd5eapi.co/api/2014/monsters/{slug}"
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return None
+            return r.json()
+
+    def _extrair_magias_monstro(self, dados_monstro):
+        return extract_monster_spells(dados_monstro)
+
+    async def _carregar_spell(self, slug_spell: str):
+        url = f"https://www.dnd5eapi.co/api/spells/{slug_spell}"
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return None
+            return r.json()
+
+    def _rolar_dano_spell(self, spell_data):
+        return roll_spell_damage(spell_data, rolar_string_dado)
+
+    def _mod_save_personagem(self, p, ability: str):
+        return get_save_modifier(p, ability, self.calc_mod)
 
     # --- SISTEMA DE DERROTA (TPK) ---
     async def verificar_tpk(self, ctx, db):
@@ -124,6 +170,7 @@ class CombateCog(commands.Cog):
 
     # --- COMANDOS DE ADMIN / MESTRE ---
     @commands.command()
+    @require_mestre()
     async def reviver(self, ctx, alvo: discord.Member):
         """Restaura a consciência de um herói (Mestre)."""
         db = SessionLocal()
@@ -135,6 +182,7 @@ class CombateCog(commands.Cog):
         db.close()
 
     @commands.command()
+    @require_mestre()
     async def limpar_combate(self, ctx):
         """Zera tudo."""
         self.monstros_ativos = []
@@ -147,6 +195,7 @@ class CombateCog(commands.Cog):
 
     # --- GERENCIAMENTO DE INIMIGOS (API) ---
     @commands.command()
+    @require_mestre()
     async def horda(self, ctx, nome_monstro: str, qtd: int):
         """Invoca monstros diretamente da API 2014."""
         self.monstros_killed = []
@@ -164,7 +213,8 @@ class CombateCog(commands.Cog):
         hp = dados.get('hit_points', 10)
         ca = dados.get('armor_class', [{'value': 10}])[0].get('value', 10)
         dex_mod = self.calc_mod(dados.get('dexterity', 10))
-        resultado_ini = random.randint(1, 20) + dex_mod
+        dado_ini = random.randint(1, 20)
+        resultado_ini = dado_ini + dex_mod
 
         for i in range(1, qtd + 1):
             n = f"{dados.get('name')} {i}"
@@ -174,7 +224,10 @@ class CombateCog(commands.Cog):
             self.ordem_combate.append({'nome': n, 'res': resultado_ini})
         
         self.ordem_combate.sort(key=lambda x: x['res'], reverse=True)
-        await ctx.send(f"👹 **{qtd}x {dados.get('name')}** (HP: {hp} | CA: {ca}) surgiram!")
+        await ctx.send(
+            f"👹 **{qtd}x {dados.get('name')}** (HP: {hp} | CA: {ca}) surgiram!\n"
+            f"🎲 Iniciativa da horda: `[{dado_ini}]` + DEX `{dex_mod}` = **{resultado_ini}**"
+        )
 
     # --- COMANDOS DE LUTA ---
     @commands.command()
@@ -184,11 +237,19 @@ class CombateCog(commands.Cog):
         p = db.query(Personagem).filter(Personagem.discord_id == str(ctx.author.id)).first()
         if not p: return await ctx.send("Crie sua ficha.")
         
-        total = random.randint(1, 20) + self.calc_mod(p.destreza)
+        mod_dex = self.calc_mod(p.destreza)
+        tem_vantagem = self._vantagem_iniciativa(p)
+        dado_ini, rolagens, modo = self._rolar_d20(vantagem=tem_vantagem)
+        total = dado_ini + mod_dex
         self.ordem_combate = [e for e in self.ordem_combate if e['nome'] != p.nome]
         self.ordem_combate.append({'nome': p.nome, 'res': total})
         self.ordem_combate.sort(key=lambda x: x['res'], reverse=True)
-        await ctx.send(f"🎲 **{p.nome}** rolou **{total}** de iniciativa!")
+        detalhe_d20 = f"`[{rolagens[0]}]`"
+        if len(rolagens) == 2:
+            detalhe_d20 = f"`[{rolagens[0]}, {rolagens[1]}]` -> `{dado_ini}`"
+        await ctx.send(
+            f"🎲 **{p.nome}** iniciativa ({modo}): {detalhe_d20} + DEX `{mod_dex}` = **{total}**"
+        )
         db.close()
 
     @commands.command()
@@ -213,15 +274,32 @@ class CombateCog(commands.Cog):
                 p.sede = min(100, p.sede + 2) # Esforço aumenta sede
 
             dado = random.randint(1, 20)
-            total = dado + mod + p.proficiencia
+            prof = int(getattr(p, "proficiencia", 2) or 2)
+            bonus_ataque = mod + prof
+            total = dado + bonus_ataque
+
+            msg += (
+                f"⚔️ **{p.nome}** vs **{alvo['nome']}** | "
+                f"`[{dado}]` + Mod `{mod}` + Prof `{prof}` = **{total}** (Bônus `{bonus_ataque}`) vs CA {alvo['ca']}\n"
+            )
             
-            msg += f"⚔️ **{p.nome}** vs **{alvo['nome']}** | `[{dado}]`+{mod} = **{total}** vs CA {alvo['ca']}\n"
-            
-            if total >= alvo['ca']:
+            falha_critica = dado == 1
+            acerto_critico = dado == 20
+
+            if falha_critica:
+                msg += "💨 **Falha crítica (1 natural)!**"
+            elif acerto_critico or total >= alvo['ca']:
                 d_list = p.arma_dano.lower().split('d')
-                dano = sum([random.randint(1, int(d_list[1])) for _ in range(int(d_list[0]))]) + mod
+                dano_dados = sum([random.randint(1, int(d_list[1])) for _ in range(int(d_list[0]))])
+                dano = dano_dados + mod
+                if acerto_critico:
+                    dano *= 2
+                    msg += "🎯 **Acerto crítico (20 natural)!**\n"
                 alvo['hp'] -= dano
-                msg += f"💥 **DANO:** {dano} (HP Alvo: {max(0, alvo['hp'])})"
+                msg += (
+                    f"💥 **DANO:** `({p.arma_dano}={dano_dados}) + Mod {mod}` = **{dano}** "
+                    f"(HP Alvo: {max(0, alvo['hp'])})"
+                )
                 if alvo['hp'] <= 0:
                     # Marca o monstro derrotado para conceder XP quando o combate virar.
                     self.monstros_killed.append({'nome': alvo.get('nome'), 'slug': alvo.get('slug')})
@@ -242,11 +320,7 @@ class CombateCog(commands.Cog):
         finally: db.close()
 
     def _magia_fallback(self, slug_norm: str):
-        return {
-            "fire-bolt": {"dano": "1d10", "custo": 0},
-            "magic-missile": {"dano": "3d4+3", "custo": 3},
-            "ray-of-frost": {"dano": "1d8", "custo": 0},
-        }.get(slug_norm)
+        return spell_fallback(slug_norm)
 
     def _buscar_magia_grimorio(self, db, personagem, slug_norm: str):
         q = db.query(Magia).filter(Magia.personagem_id == personagem.id)
@@ -280,11 +354,46 @@ class CombateCog(commands.Cog):
             if not p or p.hp <= 0:
                 return await ctx.send("❌ Você precisa de uma ficha ativa e conscientes.")
 
+            # Tenta entender entradas como:
+            # !cast flame strike "Young White Dragon 1"
+            # !cast flame-strike Young White Dragon 1
+            alvo_hint = clean_name(nome_alvo) if nome_alvo else None
             slug_norm = normalizar_index_magia(spell_slug)
             mag_db = self._buscar_magia_grimorio(db, p, slug_norm)
             fb = self._magia_fallback(slug_norm)
-
             info = MAGIA_ESPECIAL.get(slug_norm)
+
+            if nome_alvo:
+                texto_bruto = f"{spell_slug} {nome_alvo}".strip()
+                tokens = texto_bruto.split()
+                slugs_especiais = set(MAGIA_ESPECIAL.keys())
+                slugs_fallback = {"fire-bolt", "magic-missile", "ray-of-frost"}
+                slugs_grimorio = set()
+                for m in db.query(Magia).filter(Magia.personagem_id == p.id).all():
+                    if getattr(m, "index_en", None):
+                        slugs_grimorio.add(normalizar_index_magia(m.index_en))
+                    if getattr(m, "nome_pt", None):
+                        slugs_grimorio.add(normalizar_index_magia(m.nome_pt))
+                slugs_conhecidos = slugs_especiais | slugs_fallback | slugs_grimorio
+
+                for i in range(1, len(tokens)):
+                    slug_cand = normalizar_index_magia(" ".join(tokens[:i]))
+                    alvo_cand = clean_name(" ".join(tokens[i:]))
+                    if not alvo_cand:
+                        continue
+                    if slug_cand in slugs_conhecidos:
+                        alvo_existe = any(
+                            clean_name(m["nome"]).lower() == alvo_cand.lower()
+                            for m in self.monstros_ativos
+                        )
+                        if alvo_existe:
+                            slug_norm = slug_cand
+                            alvo_hint = alvo_cand
+                            mag_db = self._buscar_magia_grimorio(db, p, slug_norm)
+                            fb = self._magia_fallback(slug_norm)
+                            info = MAGIA_ESPECIAL.get(slug_norm)
+                            break
+
             if info and info.get("tipo") == "requer_invocar":
                 return await ctx.send(
                     "📌 Esta magia é invocada com `!invocar familiar <slug>` ou `!invocar morto_vivo <slug>` "
@@ -323,10 +432,24 @@ class CombateCog(commands.Cog):
                     f"Use `!pulso_guardioes` no seu turno para aplicar **{dano_str}** (teste de **DES** vs CD {dc_conjuracao_generico(p)}) em cada inimigo."
                 )
 
-            if not nome_alvo:
+            if not alvo_hint:
                 return await ctx.send("❌ Informe o alvo: `!cast fire-bolt NomeDoMonstro`.")
 
-            alvo = next((m for m in self.monstros_ativos if m["nome"].lower() == nome_alvo.lower()), None)
+            alvo = next(
+                (m for m in self.monstros_ativos if clean_name(m["nome"]).lower() == alvo_hint.lower()),
+                None,
+            )
+            if not alvo:
+                # Fallback: busca parcial para nomes com sufixos e variações leves.
+                alvo = next(
+                    (
+                        m
+                        for m in self.monstros_ativos
+                        if alvo_hint.lower() in clean_name(m["nome"]).lower()
+                        or clean_name(m["nome"]).lower() in alvo_hint.lower()
+                    ),
+                    None,
+                )
             if not alvo:
                 return await ctx.send("❌ Alvo não encontrado entre os monstros ativos.")
 
@@ -354,7 +477,7 @@ class CombateCog(commands.Cog):
             nome_mag = mag_db.nome_pt if mag_db else spell_slug.replace("-", " ").title()
 
             msg = f"✨ **{p.nome}** lança **{nome_mag}**!\n"
-            msg += f"💥 **DANO:** `{dano_final}` | 👹 Alvo: `{max(0, alvo['hp'])} HP`"
+            msg += f"💥 **DANO:** `{d_str}` = **{dano_final}** | 👹 Alvo: `{max(0, alvo['hp'])} HP`"
 
             if alvo["hp"] <= 0:
                 msg = await self._monstro_morreu(ctx, db, alvo, msg)
@@ -482,11 +605,15 @@ class CombateCog(commands.Cog):
         if ali["dono_id"] != str(ctx.author.id):
             return await ctx.send("❌ Só o dono controla este aliado.")
 
-        total = random.randint(1, 20) + int(ali.get("dex_mod", 0))
+        mod_dex = int(ali.get("dex_mod", 0))
+        dado_ini = random.randint(1, 20)
+        total = dado_ini + mod_dex
         self.ordem_combate = [e for e in self.ordem_combate if e["nome"] != ali["nome"]]
         self.ordem_combate.append({"nome": ali["nome"], "res": total, "tipo": "aliado"})
         self.ordem_combate.sort(key=lambda x: x["res"], reverse=True)
-        await ctx.send(f"🎲 **{ali['nome']}** rolou **{total}** de iniciativa!")
+        await ctx.send(
+            f"🎲 **{ali['nome']}** iniciativa: `[{dado_ini}]` + DEX `{mod_dex}` = **{total}**"
+        )
 
     @commands.command()
     async def aliado_atacar(self, ctx, nome_aliado: str, nome_monstro: str):
@@ -521,18 +648,132 @@ class CombateCog(commands.Cog):
             bonus = ataque.get("attack_bonus", 0)
             total = dado + bonus
             msg = f"🐾 **{ali['nome']}** vs **{alvo['nome']}** | `[{dado}]`+{bonus} = **{total}** vs CA {alvo['ca']}\n"
+            falha_critica = dado == 1
+            acerto_critico = dado == 20
 
-            if total >= alvo["ca"]:
+            if falha_critica:
+                msg += "💨 **Falha crítica (1 natural)!**"
+            elif acerto_critico or total >= alvo["ca"]:
                 dd = ataque.get("damage", [{}])[0].get("damage_dice", "1d4")
-                dano = rolar_string_dado(dd.replace("-", "+"))
+                dano_expr = dd.replace("-", "+")
+                dano = rolar_string_dado(dano_expr)
+                if acerto_critico:
+                    dano *= 2
+                    msg += "🎯 **Acerto crítico (20 natural)!**\n"
                 alvo["hp"] -= dano
-                msg += f"💥 **DANO:** {dano} (HP: {max(0, alvo['hp'])})"
+                msg += f"💥 **DANO:** `{dano_expr}` = **{dano}** (HP: {max(0, alvo['hp'])})"
                 if alvo["hp"] <= 0:
                     msg = await self._monstro_morreu(ctx, db, alvo, msg)
                 db.commit()
             else:
                 msg += "🛡️ Errou!"
                 db.commit()
+            await ctx.send(msg)
+        finally:
+            db.close()
+
+    @commands.command()
+    async def aliado_magias(self, ctx, *, nome_aliado: str):
+        """Lista as magias do aliado invocado (se houver spellcasting na API)."""
+        ali = next((a for a in self.aliados if a["nome"].lower() == nome_aliado.lower()), None)
+        if not ali:
+            ali = next((a for a in self.aliados if nome_aliado.lower() in a["nome"].lower()), None)
+        if not ali:
+            return await ctx.send("❌ Aliado não encontrado.")
+        if ali["dono_id"] != str(ctx.author.id):
+            return await ctx.send("❌ Só o dono pode consultar este aliado.")
+
+        dados = await self._carregar_ficha_monstro(ali["slug"])
+        if not dados:
+            return await ctx.send("❌ Não foi possível carregar a ficha do aliado na API.")
+        magias = self._extrair_magias_monstro(dados)
+        if not magias:
+            return await ctx.send(f"ℹ️ **{ali['nome']}** não possui lista de magias na API.")
+
+        linhas = [f"📜 **Magias de {ali['nome']}**:"]
+        for m in magias[:30]:
+            linhas.append(f"- {m['nome']} (`{m['slug']}`)")
+        if len(magias) > 30:
+            linhas.append(f"*...e mais {len(magias) - 30}.*")
+        await ctx.send("\n".join(linhas))
+
+    @commands.command()
+    async def aliado_cast(self, ctx, nome_aliado: str, magia_slug: str, *, nome_monstro: str):
+        """
+        O dono ordena o aliado a conjurar magia em um monstro.
+        Uso: !aliado_cast "NOME_ALIADO" fire-bolt "Goblin 1"
+        """
+        db = SessionLocal()
+        try:
+            ali = next((a for a in self.aliados if a["nome"].lower() == nome_aliado.lower()), None)
+            if not ali:
+                ali = next((a for a in self.aliados if nome_aliado.lower() in a["nome"].lower()), None)
+            if not ali:
+                return await ctx.send("❌ Aliado não encontrado.")
+            if ali["dono_id"] != str(ctx.author.id):
+                return await ctx.send("❌ Só o dono pode comandar este aliado.")
+
+            alvo = self._achar_monstro_ativo(nome_monstro)
+            if not alvo:
+                return await ctx.send("❌ Monstro alvo não encontrado.")
+
+            dados = await self._carregar_ficha_monstro(ali["slug"])
+            if not dados:
+                return await ctx.send("❌ Não foi possível carregar a ficha do aliado.")
+            magias = self._extrair_magias_monstro(dados)
+            slug = magia_slug.lower().strip().replace(" ", "-")
+            spell_ref = next((m for m in magias if m["slug"].lower() == slug), None)
+            if not spell_ref:
+                return await ctx.send(
+                    f"❌ `{magia_slug}` não está na lista do aliado. Use `!aliado_magias \"{ali['nome']}\"`."
+                )
+
+            spell = await self._carregar_spell(slug)
+            if not spell:
+                return await ctx.send("❌ Não foi possível carregar os dados da magia.")
+
+            dano_base, dano_expr = self._rolar_dano_spell(spell)
+            if dano_base <= 0:
+                return await ctx.send(
+                    f"✨ **{ali['nome']}** conjurou **{spell_ref['nome']}**, "
+                    "mas essa magia não tem dano automático configurado na API."
+                )
+
+            # CD aproximada para aliado conjurador (baseada no bloco da criatura).
+            # 8 + bônus de proficiência aproximado pelo challenge rating + mod de conjuração genérico.
+            # Para manter simples/consistente no bot, usamos um valor fixo de 12.
+            dc_val = 12
+            dc = (spell.get("dc", {}) or {})
+            dc_type = (dc.get("dc_type", {}) or {}).get("index")
+            if dc.get("dc_value"):
+                dc_val = int(dc["dc_value"])
+
+            dano_final = dano_base
+            msg = f"✨ **{ali['nome']}** conjura **{spell_ref['nome']}** em **{alvo['nome']}**!\n"
+            if dc_type:
+                # Apenas DEX save para monstros está disponível no estado atual.
+                if dc_type == "dex":
+                    mod_save = int(alvo.get("dex_mod", 0))
+                else:
+                    mod_save = 0
+                d20 = random.randint(1, 20)
+                total_save = d20 + mod_save
+                success_type = (dc.get("success_type") or "half").lower()
+                passou = total_save >= int(dc_val)
+                if passou and success_type == "none":
+                    dano_final = 0
+                elif passou:
+                    dano_final = dano_base // 2
+                msg += (
+                    f"🎲 Save `{dc_type.upper()}`: `[{d20}]`+{mod_save} = **{total_save}** "
+                    f"vs CD **{dc_val}**.\n"
+                )
+
+            alvo["hp"] -= int(dano_final)
+            msg += f"💥 Dano: `{dano_expr}` => **{dano_final}** | HP de **{alvo['nome']}**: `{max(0, alvo['hp'])}`"
+            if alvo["hp"] <= 0:
+                msg = await self._monstro_morreu(ctx, db, alvo, msg)
+            db.commit()
             await ctx.send(msg)
         finally:
             db.close()
@@ -553,6 +794,7 @@ class CombateCog(commands.Cog):
         await ctx.send(f"👋 **{ali['nome']}** foi dispensado.")
 
     @commands.command()
+    @require_mestre()
     async def mob_atacar(self, ctx, nome_instancia: str, alvo_user: discord.Member):
         """Ataque do inimigo contra o herói."""
         db = SessionLocal()
@@ -570,19 +812,122 @@ class CombateCog(commands.Cog):
             
             dado, bonus = random.randint(1, 20), ataque.get('attack_bonus', 0)
             total = dado + bonus
-            msg = f"👹 **{nome_instancia}** ataca **{p.nome}**! `[{dado}]`+{bonus} = **{total}**\n"
+            ca_heroi = 10 + self.calc_mod(p.destreza)
+            msg = f"👹 **{nome_instancia}** ataca **{p.nome}**! `[{dado}]`+{bonus} = **{total}** vs CA {ca_heroi}\n"
+            falha_critica = dado == 1
+            acerto_critico = dado == 20
 
-            if total >= (10 + self.calc_mod(p.destreza)):
+            if falha_critica:
+                msg += "💨 **Falha crítica (1 natural)!**"
+            elif acerto_critico or total >= ca_heroi:
                 d_dice = ataque.get('damage', [{}])[0].get('damage_dice', "1d4").replace('-', '+').split('+')
-                dano = sum([random.randint(1, int(d_dice[0].split('d')[1])) for _ in range(int(d_dice[0].split('d')[0]))]) + (int(d_dice[1]) if len(d_dice)>1 else 0)
+                dano_expr = ataque.get('damage', [{}])[0].get('damage_dice', "1d4").replace('-', '+')
+                dano = rolar_string_dado(dano_expr)
+                if acerto_critico:
+                    dano *= 2
+                    msg += "🎯 **Acerto crítico (20 natural)!**\n"
                 p.hp = max(0, p.hp - dano)
-                msg += f"💥 **ACERTOU!** Dano: {dano} | HP: {p.hp}"
+                msg += f"💥 **ACERTOU!** Dano: `{dano_expr}` = **{dano}** | HP: {p.hp}"
                 if p.hp == 0: msg += "\n🩸 **O HERÓI CAIU!**"
                 db.commit()
                 await self.verificar_tpk(ctx, db)
             else: msg += "🛡️ Errou!"
             await ctx.send(msg)
         finally: db.close()
+
+    @commands.command()
+    @require_mestre()
+    async def mob_magias(self, ctx, *, nome_instancia: str):
+        """Lista as magias disponíveis para um monstro ativo."""
+        mon = self._achar_monstro_ativo(nome_instancia)
+        if not mon:
+            return await ctx.send("❌ Monstro não encontrado entre os ativos.")
+
+        dados = await self._carregar_ficha_monstro(mon["slug"])
+        if not dados:
+            return await ctx.send("❌ Não foi possível carregar a ficha do monstro na API.")
+
+        magias = self._extrair_magias_monstro(dados)
+        if not magias:
+            return await ctx.send(f"ℹ️ **{mon['nome']}** não possui lista de magias na API.")
+
+        linhas = [f"🧙 **Magias de {mon['nome']}**:"]
+        for m in magias[:30]:
+            linhas.append(f"- {m['nome']} (`{m['slug']}`)")
+        if len(magias) > 30:
+            linhas.append(f"*...e mais {len(magias)-30}.*")
+        await ctx.send("\n".join(linhas))
+
+    @commands.command()
+    @require_mestre()
+    async def mob_cast(self, ctx, nome_instancia: str, magia_slug: str, alvo_user: discord.Member):
+        """
+        Conjura magia de um monstro ativo contra um jogador.
+        Uso: !mob_cast "Goblin 1" fire-bolt @Jogador
+        """
+        db = SessionLocal()
+        try:
+            mon = self._achar_monstro_ativo(nome_instancia)
+            if not mon:
+                return await ctx.send("❌ Monstro não encontrado entre os ativos.")
+
+            p = db.query(Personagem).filter(Personagem.discord_id == str(alvo_user.id)).first()
+            if not p:
+                return await ctx.send("❌ Jogador alvo sem ficha.")
+
+            dados = await self._carregar_ficha_monstro(mon["slug"])
+            if not dados:
+                return await ctx.send("❌ Não foi possível carregar a ficha do monstro.")
+
+            magias = self._extrair_magias_monstro(dados)
+            slug = magia_slug.lower().strip().replace(" ", "-")
+            spell_ref = next((m for m in magias if m["slug"].lower() == slug), None)
+            if not spell_ref:
+                return await ctx.send(
+                    f"❌ `{magia_slug}` não está na lista do monstro. Use `!mob_magias \"{mon['nome']}\"`."
+                )
+
+            spell = await self._carregar_spell(slug)
+            if not spell:
+                return await ctx.send("❌ Não foi possível carregar os dados da magia na API.")
+
+            dano_base, dano_expr = self._rolar_dano_spell(spell)
+            if dano_base <= 0:
+                return await ctx.send(
+                    f"✨ **{mon['nome']}** conjurou **{spell_ref['nome']}**, "
+                    "mas essa magia não tem dano automático configurado na API."
+                )
+
+            dc = (spell.get("dc", {}) or {})
+            dc_val = dc.get("dc_value")
+            save_ability = (dc.get("dc_type", {}) or {}).get("index")
+
+            msg = f"✨ **{mon['nome']}** conjura **{spell_ref['nome']}** em **{p.nome}**!\n"
+            dano_final = dano_base
+            if dc_val and save_ability:
+                mod_save = self._mod_save_personagem(p, save_ability)
+                d20 = random.randint(1, 20)
+                total_save = d20 + mod_save
+                success_type = (dc.get("success_type") or "half").lower()
+                passou = total_save >= int(dc_val)
+                if passou and success_type == "none":
+                    dano_final = 0
+                elif passou:
+                    dano_final = dano_base // 2
+                msg += (
+                    f"🎲 Save `{save_ability.upper()}`: `[{d20}]`+{mod_save} = **{total_save}** "
+                    f"vs CD **{dc_val}**.\n"
+                )
+
+            p.hp = max(0, int(p.hp or 0) - int(dano_final))
+            msg += f"💥 Dano: `{dano_expr}` => **{dano_final}** | HP de **{p.nome}**: `{p.hp}`"
+            if p.hp == 0:
+                msg += "\n🩸 **O HERÓI CAIU!**"
+            db.commit()
+            await self.verificar_tpk(ctx, db)
+            await ctx.send(msg)
+        finally:
+            db.close()
 
     @commands.command()
     async def ordem(self, ctx):

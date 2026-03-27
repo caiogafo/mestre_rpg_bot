@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 
 from database import SessionLocal, Personagem, Item
+from permissions import require_mestre
 from xp_system import aplicar_xp_personagem
 
 
@@ -10,7 +11,7 @@ class XPCog(commands.Cog):
         self.bot = bot
 
     @commands.command()
-    @commands.has_permissions(administrator=True)
+    @require_mestre()
     async def ganhar_xp(self, ctx, quantidade: int, alvo_user: discord.Member):
         """Mestre: concede XP para o personagem do usuário informado."""
         if quantidade <= 0:
@@ -35,8 +36,29 @@ class XPCog(commands.Cog):
         finally:
             db.close()
 
+    @commands.command(aliases=["curar"])
+    @require_mestre()
+    async def icurar(self, ctx, alvo_user: discord.Member, pontos: int):
+        """Mestre: cura direta de HP. Ex: !icurar @Jogador +10"""
+        if pontos <= 0:
+            return await ctx.send("❌ Informe pontos positivos. Ex.: `!icurar @Jogador +10`")
+
+        db = SessionLocal()
+        try:
+            p = db.query(Personagem).filter(Personagem.discord_id == str(alvo_user.id)).first()
+            if not p:
+                return await ctx.send("❌ Esse usuário não possui ficha.")
+
+            antes = int(p.hp or 0)
+            p.hp = min(int(p.hp_max or 0), antes + int(pontos))
+            curado = int(p.hp) - antes
+            db.commit()
+            await ctx.send(f"✨ **{p.nome}** recebeu cura de **{curado} HP** (`{p.hp}/{p.hp_max}`).")
+        finally:
+            db.close()
+
     @commands.command()
-    @commands.has_permissions(administrator=True)
+    @require_mestre()
     async def achar_item(
         self,
         ctx,
@@ -105,6 +127,41 @@ class XPCog(commands.Cog):
             for it in itens:
                 embed.add_field(name=f"📦 {it.quantidade}x", value=f"`{it.nome}`", inline=False)
             await ctx.send(embed=embed)
+        finally:
+            db.close()
+
+    @commands.command()
+    async def usar(self, ctx, *, nome_item: str):
+        """
+        Usa 1 unidade de um item da mochila (somente consumo).
+        A cura/efeito mecânico é aplicada manualmente pelo mestre.
+        """
+        nome_item = nome_item.strip().strip('"').strip("'")
+        if not nome_item:
+            return await ctx.send("❌ Informe o nome do item. Ex.: `!usar \"Poção de Cura\"`")
+
+        db = SessionLocal()
+        try:
+            p = db.query(Personagem).filter(Personagem.discord_id == str(ctx.author.id)).first()
+            if not p:
+                return await ctx.send("❌ Use `!criar_ficha` primeiro.")
+
+            item = db.query(Item).filter(Item.personagem_id == p.id, Item.nome.ilike(nome_item)).first()
+            if not item:
+                return await ctx.send("❓ Item não encontrado na mochila.")
+
+            atual = int(item.quantidade or 0)
+            if atual <= 0:
+                return await ctx.send("❓ Você não tem esse item disponível.")
+
+            # Consome 1 unidade
+            if atual == 1:
+                db.delete(item)
+            else:
+                item.quantidade = atual - 1
+
+            db.commit()
+            await ctx.send(f"🧪 **{p.nome}** usou **1x `{item.nome}`** (item consumido).")
         finally:
             db.close()
 

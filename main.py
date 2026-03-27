@@ -3,9 +3,10 @@ import pathlib
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from database import engine, Base, Personagem, Item, Magia
+from database import init_db
+from permissions import require_mestre
 
-Base.metadata.create_all(bind=engine)
+init_db()
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -33,7 +34,7 @@ class MestreBot(commands.Bot):
 bot = MestreBot()
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+@require_mestre()
 async def reload(ctx, extension):
     """Recarrega um módulo sem desligar o bot. Uso: !reload magia"""
     try:
